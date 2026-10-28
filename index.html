@@ -1523,10 +1523,22 @@ async function loadDataForUser(profile) {
       if (error) throw error;
       if (data?.data && Object.keys(data.data).length > 0) {
         DB.data = data.data; DB.normalize();
-        // tambahkan profile ke users lokal
+        // tambahkan profile ke users lokal (merge permissions dengan benar)
         DB.data.users = DB.data.users || [];
-        if (!DB.data.users.find(u=>u.username===profile.username)) DB.data.users.push(profile);
-        else Object.assign(DB.data.users.find(u=>u.username===profile.username), profile);
+        const existingUser = DB.data.users.find(u => u.username === profile.username);
+        if (!existingUser) {
+          DB.data.users.push(profile);
+        } else {
+          // FIX ROLE BUG: permissions profile dari Supabase menang,
+          // tapi kalau kosong, pakai yang existing (jangan override jadi empty)
+          const merged = { ...existingUser, ...profile };
+          const hasValidProfilePerms = Array.isArray(profile.permissions) && profile.permissions.length > 0;
+          const hasValidExistingPerms = Array.isArray(existingUser.permissions) && existingUser.permissions.length > 0;
+          if (!hasValidProfilePerms && hasValidExistingPerms) {
+            merged.permissions = existingUser.permissions;
+          }
+          Object.assign(existingUser, merged);
+        }
         localStorage.setItem(DB_KEY, JSON.stringify(DB.data));
         updateSyncIndicator('online', data.updated_at);
         console.log('✅ Data dari Supabase');
@@ -1561,9 +1573,14 @@ function openProfileMenu() {
 }
 function getCompanyInitials() { const nama = DB.data?.company?.nama || DB.data?.master?.toko?.nama || 'Parfumku'; const words = nama.split(/\s+/).filter(w=>w.length>0); if (words.length===1) return words[0].slice(0,2).toUpperCase(); return words.slice(0,2).map(w=>w[0].toUpperCase()).join(''); }
 
+// ═══ PERMISSIONS ═══
 function canAccess(page) {
   const u = getUser(); if (!u) return false;
-  if (Array.isArray(u.permissions)) { if (u.permissions.includes('*')) return true; return u.permissions.includes(page); }
+  // FIX ROLE BUG: empty array harus fallback ke role, bukan block semua akses
+  if (Array.isArray(u.permissions) && u.permissions.length > 0) {
+    if (u.permissions.includes('*')) return true;
+    return u.permissions.includes(page);
+  }
   const perms = ROLE_PERMISSIONS[u.role] || [];
   return perms.includes('*') || perms.includes(page);
 }
@@ -1573,7 +1590,12 @@ function canAction(action) {
   return allowed.includes(u.role);
 }
 function getMaxDiskon() { const u = getUser(); if (!u) return 0; if (u.role==='owner') return 100; return Number(DB.data.master?.diskon?.[u.role] ?? 10); }
-function applyPermissionsToDOM() { document.querySelectorAll('[data-perm]').forEach(el => { if (!canAction(el.dataset.perm)) el.style.display='none'; }); }
+function applyPermissionsToDOM() {
+  // FIX ROLE BUG: re-show element saat permission ditambah
+  document.querySelectorAll('[data-perm]').forEach(el => {
+    el.style.display = canAction(el.dataset.perm) ? '' : 'none';
+  });
+}
 
 // ═══ LOGO ═══
 async function handleLogoUpload(e) {
@@ -1632,10 +1654,17 @@ function applyPermissionsToSidebar() {
 function goTo(page) {
   if (!PAGES.includes(page)) page = 'dashboard';
   if (!canAccess(page)) {
-    toast('🚫 Tidak ada akses','error');
-    const u = getUser(); const perms = Array.isArray(u?.permissions)?u.permissions:(ROLE_PERMISSIONS[u?.role]||[]);
-    const fallback = perms.includes('*')?'dashboard':(perms[0]||'kasir');
-    if (page !== fallback) return goTo(fallback);
+    toast('🚫 Tidak ada akses ke halaman ini', 'error');
+    const u = getUser();
+    const perms = (Array.isArray(u?.permissions) && u.permissions.length > 0)
+      ? u.permissions
+      : (ROLE_PERMISSIONS[u?.role] || []);
+    const fallback = perms.includes('*') ? 'dashboard' : (perms[0] || 'dashboard');
+    if (page !== fallback && canAccess(fallback)) return goTo(fallback);
+    // Tidak ada halaman yang bisa diakses sama sekali — jangan render blank page
+    document.querySelectorAll('.page').forEach(p => p.classList.add('hidden-page'));
+    document.getElementById('breadcrumb').innerHTML =
+      '<span class="text-red-500 font-semibold">⚠️ Akun ini tidak memiliki akses. Hubungi Owner.</span>';
     return;
   }
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden-page'));
@@ -2523,7 +2552,6 @@ function drawVoucherCanvas(v, cb) {
   const toko = DB.data.master.toko?.nama||'Parfumku';
   const logo = DB.data.master.logo;
   const drawText = (text,y,size,weight,color) => { ctx.fillStyle=color||'#fff'; ctx.font=`${weight||'bold'} ${size}px Inter,Arial,sans-serif`; ctx.textAlign='center'; ctx.fillText(text,W/2,y); };
-  // logo
   if (logo && logo.startsWith('data:image')) {
     const img = new Image(); img.src = logo;
     img.onload = () => {
@@ -2785,7 +2813,6 @@ async function doAbsen(tipe) {
   if (tipe==='masuk') {
     if (abs && abs.jam_masuk) return toast('Sudah masuk','warning');
     const jam = fmtJam();
-    // cek jadwal
     const sch = (DB.data.shift_schedules||[]).find(s => s.karyawan_id===kid && s.tanggal===tgl);
     const tol = DB.data.master.shift?.toleransi_menit ?? 10;
     let status = 'hadir';
@@ -2976,7 +3003,7 @@ function loadHakAkses() {
   const d = DB.data;
   document.getElementById('userTableBody').innerHTML = d.users.map(u => {
     const role = d.roles.find(r=>r.nama===u.role) || { label:u.role, warna:'bg-slate-100 text-slate-600' };
-    const perms = Array.isArray(u.permissions)?u.permissions:(ROLE_PERMISSIONS[u.role]||[]);
+    const perms = (Array.isArray(u.permissions) && u.permissions.length > 0) ? u.permissions : (ROLE_PERMISSIONS[u.role]||[]);
     const aksesLabel = perms.includes('*')?'<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 font-semibold">👑 Semua</span>':`<span class="text-xs px-2 py-0.5 rounded-full bg-primary-soft text-primary font-semibold">${perms.length} hal</span>`;
     const isAdmin = u.username==='admin';
     return `<tr class="border-b border-slate-50"><td class="py-2 px-3 font-mono text-xs">${escapeHtml(u.username)}${isAdmin?' 👑':''}</td><td class="py-2 px-3 font-medium">${escapeHtml(u.nama)}</td><td class="py-2 px-3"><span class="text-xs px-2 py-0.5 rounded-full font-semibold ${role.warna}">${role.label}</span></td><td class="py-2 px-3 text-center">${aksesLabel}</td></tr>`;
@@ -3002,10 +3029,15 @@ const PAGE_GROUPS = {
 };
 let aturAksesUserId = null;
 function openAturAkses(userId) {
+  // FIX ROLE BUG: guard action
+  if (!canAction('user.kelola')) return toast('Hanya Owner yang bisa atur akses', 'error');
   const u = DB.data.users.find(x=>x.id===userId); if (!u) return;
   aturAksesUserId = userId;
   const isAdmin = u.username==='admin';
-  const currentPerms = Array.isArray(u.permissions)?u.permissions:(ROLE_PERMISSIONS[u.role]||[]);
+  // FIX ROLE BUG: fallback ke default role kalau permissions kosong
+  const currentPerms = (Array.isArray(u.permissions) && u.permissions.length > 0)
+    ? u.permissions
+    : (ROLE_PERMISSIONS[u.role] || []);
   const hasAll = currentPerms.includes('*');
   document.getElementById('formTitle').textContent = `🔐 ${u.nama}`;
   document.getElementById('formBody').innerHTML = `${isAdmin?'<div class="p-3 rounded-lg bg-red-50 text-xs text-red-700 mb-2"><b>👑 Owner:</b> Semua akses</div>':''}<div class="flex gap-2 mb-3"><button type="button" onclick="toggleAllAkses(true)" class="flex-1 py-2 rounded-lg bg-primary-soft text-primary text-xs font-semibold" ${isAdmin?'disabled':''}>✓ Semua</button><button type="button" onclick="toggleAllAkses(false)" class="flex-1 py-2 rounded-lg bg-slate-100 text-slate-600 text-xs font-semibold" ${isAdmin?'disabled':''}>✗ Hapus</button></div><div class="space-y-3 max-h-[50vh] overflow-y-auto pr-1">${Object.entries(PAGE_GROUPS).map(([gn,pages])=>`<div class="border border-app-border rounded-xl overflow-hidden"><div class="px-3 py-2 bg-slate-50 font-semibold text-xs text-slate-700">${gn}</div><div class="p-2 grid grid-cols-2 gap-1">${pages.map(p=>`<label class="flex items-center gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer"><input type="checkbox" class="akses-checkbox w-4 h-4 accent-primary" data-page="${p.id}" ${hasAll||currentPerms.includes(p.id)?'checked':''} ${isAdmin?'disabled':''}><span class="text-sm">${p.icon} ${p.label}</span></label>`).join('')}</div></div>`).join('')}</div><div class="mt-3 p-3 rounded-lg bg-primary-soft text-xs"><b>📊 Terpilih:</b> <span id="aksesCounter">0</span></div>`;
@@ -3018,14 +3050,47 @@ function openAturAkses(userId) {
 function updateAksesCounter() { const c = document.querySelectorAll('.akses-checkbox:checked').length; const t = document.querySelectorAll('.akses-checkbox').length; const el = document.getElementById('aksesCounter'); if (el) el.textContent = `${c} / ${t}`; }
 function toggleAllAkses(s) { document.querySelectorAll('.akses-checkbox').forEach(cb => { if (!cb.disabled) cb.checked = s; }); updateAksesCounter(); }
 function submitAturAkses() {
+  // FIX ROLE BUG: guard action
+  if (!canAction('user.kelola')) return toast('Hanya Owner yang bisa atur akses', 'error');
   const u = DB.data.users.find(x=>x.id===aturAksesUserId); if (!u) return;
-  if (u.username==='admin') u.permissions = ['*'];
-  else u.permissions = [...document.querySelectorAll('.akses-checkbox:checked')].map(cb => cb.dataset.page);
-  DB.save(); logAct(`Update akses: ${u.username}`,'Master');
-  closeModal('modalForm'); document.getElementById('formSubmitBtn').textContent = 'Simpan'; document.getElementById('formSubmitBtn').onclick = submitForm;
-  renderMasterUsers(); toast('✅','success');
+
+  if (u.username==='admin') {
+    u.permissions = ['*'];
+  } else {
+    u.permissions = [...document.querySelectorAll('.akses-checkbox:checked')].map(cb => cb.dataset.page);
+    // FIX ROLE BUG: kalau kosong, isi default role supaya tidak blank
+    if (u.permissions.length === 0) {
+      u.permissions = [...(ROLE_PERMISSIONS[u.role] || [])];
+      toast('⚠️ Tidak ada akses dipilih, dipakai default role', 'warning', 3000);
+    }
+  }
+
+  DB.save();
+  logAct(`Update akses: ${u.username}`, 'Master');
+
+  // FIX ROLE BUG: sync permissions ke Supabase profiles
+  if (sb && !String(u.id).startsWith('local_')) {
+    sb.from('profiles')
+      .update({ permissions: u.permissions, updated_at: new Date().toISOString() })
+      .eq('username', u.username)
+      .then(({ error }) => {
+        if (error) console.warn('❌ sync permissions fail:', error);
+        else console.log('✅ permissions synced to Supabase:', u.username);
+      });
+  }
+
+  closeModal('modalForm');
+  document.getElementById('formSubmitBtn').textContent = 'Simpan';
+  document.getElementById('formSubmitBtn').onclick = submitForm;
+  renderMasterUsers();
+  toast('✅ Akses tersimpan', 'success');
+
   const current = getUser();
-  if (current && current.id === u.id) { applyPermissionsToSidebar(); applyPermissionsToDOM(); if (!canAccess(location.hash.slice(1)||'dashboard')) goTo('dashboard'); }
+  if (current && current.id === u.id) {
+    applyPermissionsToSidebar();
+    applyPermissionsToDOM();
+    if (!canAccess(location.hash.slice(1) || 'dashboard')) goTo('dashboard');
+  }
 }
 function renderMasterUsers() {
   const tbody = document.getElementById('masterUsersBody'); if (!tbody) return;
@@ -3033,7 +3098,8 @@ function renderMasterUsers() {
   tbody.innerHTML = d.users.length ? d.users.map(u => {
     const role = d.roles.find(r=>r.nama===u.role) || { label:u.role, warna:'bg-slate-100 text-slate-600' };
     const isAdmin = u.username==='admin';
-    const perms = Array.isArray(u.permissions)?u.permissions:(ROLE_PERMISSIONS[u.role]||[]);
+    // FIX ROLE BUG: fallback role perms kalau kosong
+    const perms = (Array.isArray(u.permissions) && u.permissions.length > 0) ? u.permissions : (ROLE_PERMISSIONS[u.role]||[]);
     const aksesLabel = perms.includes('*')?'<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700 font-semibold">👑 Semua</span>':`<span class="text-xs px-2 py-0.5 rounded-full bg-primary-soft text-primary font-semibold">${perms.length} hal</span>`;
     return `<tr class="border-b border-slate-50 hover:bg-slate-50"><td class="py-2.5 px-3 font-mono text-xs">${escapeHtml(u.username)}${isAdmin?' 👑':''}</td><td class="py-2.5 px-3 font-medium">${escapeHtml(u.nama)}</td><td class="py-2.5 px-3"><span class="text-xs px-2 py-0.5 rounded-full font-semibold ${role.warna}">${role.label}</span></td><td class="py-2.5 px-3">${aksesLabel}</td><td class="py-2.5 px-3 text-center"><input type="checkbox" ${u.aktif!==false?'checked':''} ${isAdmin?'disabled':''} onchange="toggleUserAktifMaster('${u.id}', this.checked)" class="w-4 h-4 accent-primary"></td><td class="py-2.5 px-3 text-center whitespace-nowrap"><button onclick="openAturAkses('${u.id}')" class="p-1.5 rounded hover:bg-primary-soft text-primary" title="Akses"><i data-lucide="shield-check" class="w-3.5 h-3.5"></i></button><button onclick="editUserMaster('${u.id}')" class="p-1.5 rounded hover:bg-slate-100 text-slate-600"><i data-lucide="edit-2" class="w-3.5 h-3.5"></i></button>${!isAdmin?`<button onclick="hapusUserMaster('${u.id}')" class="p-1.5 rounded hover:bg-red-50 text-red-500"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>`:''}</td></tr>`;
   }).join('') : `<tr><td colspan="6" class="text-center text-slate-400 text-sm py-6">Belum ada user</td></tr>`;
@@ -3061,6 +3127,7 @@ function editUserMaster(id) {
   openModal('modalForm');
 }
 function submitUserMaster() {
+  if (!canAction('user.kelola')) return toast('Hanya Owner', 'error');
   const username = document.getElementById('muUsername').value.trim().toLowerCase();
   const nama = document.getElementById('muNama').value.trim();
   const email = document.getElementById('muEmail').value.trim();
@@ -3070,18 +3137,54 @@ function submitUserMaster() {
   if (!/^[a-z0-9_.-]{3,}$/.test(username)) return toast('Username min 3 karakter','error');
   const dup = DB.data.users.find(u => u.username===username && u.id!==editingUserIdMaster);
   if (dup) return toast('Username sudah dipakai','error');
+
   if (editingUserIdMaster) {
     const u = DB.data.users.find(x=>x.id===editingUserIdMaster); if (!u) return;
+    const oldUsername = u.username;
+    const oldRole = u.role;
     u.nama = nama; u.email = email;
     if (u.username !== 'admin') { u.username = username; u.role = role; }
-    if (password) { if (password.length<4) return toast('Password min 4','error'); u.password_hash = hashPassword(password); }
+    // FIX ROLE BUG: kalau role berubah & permissions kosong → isi default role baru
+    if (oldRole !== u.role && (!Array.isArray(u.permissions) || u.permissions.length === 0)) {
+      u.permissions = [...(ROLE_PERMISSIONS[u.role] || [])];
+    }
+    if (password) {
+      if (password.length<4) return toast('Password min 4','error');
+      u.password_hash = hashPassword(password);
+    }
     toast('✅ Diperbarui','success'); DB.save(); closeModal('modalForm'); renderMasterUsers();
+
+    // FIX ROLE BUG: sync ke Supabase
+    if (sb && !String(u.id).startsWith('local_')) {
+      const payload = {
+        nama, email, role: u.role, permissions: u.permissions,
+        updated_at: new Date().toISOString()
+      };
+      if (password) payload.password_hash = u.password_hash;
+      if (oldUsername !== 'admin' && username !== oldUsername) payload.username = username;
+      sb.from('profiles').update(payload).eq('username', oldUsername)
+        .then(({ error }) => { if (error) console.warn('sync user fail', error); else console.log('✅ user updated in Supabase'); });
+    }
   } else {
     if (!password || password.length<4) return toast('Password min 4','error');
-    const newUser = { id:uuid(), username, nama, email, password_hash:hashPassword(password), role, aktif:true, permissions:[] };
+    // FIX ROLE BUG: default permissions dari role, bukan []
+    const defaultPerms = [...(ROLE_PERMISSIONS[role] || [])].filter(p => p !== '*');
+    const newUser = {
+      id: uuid(), username, nama, email,
+      password_hash: hashPassword(password),
+      role, aktif: true,
+      permissions: defaultPerms
+    };
     DB.data.users.push(newUser);
-    // push to supabase profiles
-    if (sb) sb.from('profiles').insert({ username, nama, email, role, password_hash:newUser.password_hash, aktif:true, permissions:[] }).then(()=>{}).catch(e=>console.warn(e));
+    // FIX ROLE BUG: insert ke Supabase dengan permissions yang benar
+    if (sb) {
+      sb.from('profiles').insert({
+        username, nama, email, role,
+        password_hash: newUser.password_hash,
+        aktif: true,
+        permissions: defaultPerms
+      }).then(({ error }) => { if (error) console.warn('insert user fail', error); else console.log('✅ user created in Supabase'); });
+    }
     toast('✅ User ditambahkan','success',3500); DB.save(); closeModal('modalForm'); renderMasterUsers();
     setTimeout(()=>openAturAkses(newUser.id), 300);
   }
@@ -3089,15 +3192,36 @@ function submitUserMaster() {
   document.getElementById('formSubmitBtn').onclick = submitForm;
 }
 function toggleUserAktifMaster(id, aktif) {
+  // FIX ROLE BUG: guard action
+  if (!canAction('user.kelola')) { renderMasterUsers(); return toast('Hanya Owner', 'error'); }
   const u = DB.data.users.find(x=>x.id===id); if (!u) return;
   if (u.username==='admin' && !aktif) return toast('Owner tidak bisa dinonaktifkan','error');
-  u.aktif = aktif; DB.save(); toast(aktif?'✅ Aktif':'🚫 Nonaktif','success'); renderMasterUsers();
+  u.aktif = aktif; DB.save();
+  // FIX ROLE BUG: sync aktif ke Supabase
+  if (sb && !String(u.id).startsWith('local_')) {
+    sb.from('profiles')
+      .update({ aktif, updated_at: new Date().toISOString() })
+      .eq('username', u.username)
+      .then(({ error }) => { if (error) console.warn('sync aktif fail', error); });
+  }
+  toast(aktif?'✅ Aktif':'🚫 Nonaktif','success'); renderMasterUsers();
 }
 function hapusUserMaster(id) {
+  // FIX ROLE BUG: guard action
+  if (!canAction('user.kelola')) return toast('Hanya Owner', 'error');
   const u = DB.data.users.find(x=>x.id===id); if (!u) return;
   if (u.username==='admin') return toast('Owner tidak bisa dihapus','error');
   if (u.id === getUser()?.id) return toast('Tidak bisa hapus akun sendiri','error');
-  showConfirm('Hapus User',`Hapus "${u.nama}"?`,()=>{ DB.data.users = DB.data.users.filter(x=>x.id!==id); DB.save(); renderMasterUsers(); toast('🗑️','info'); });
+  showConfirm('Hapus User',`Hapus "${u.nama}"?`,()=>{
+    DB.data.users = DB.data.users.filter(x=>x.id!==id);
+    DB.save();
+    // FIX ROLE BUG: sync delete ke Supabase
+    if (sb && !String(u.id).startsWith('local_')) {
+      sb.from('profiles').delete().eq('username', u.username)
+        .then(({ error }) => { if (error) console.warn('delete user fail', error); else console.log('✅ user deleted in Supabase'); });
+    }
+    renderMasterUsers(); toast('🗑️','info');
+  });
 }
 
 // ═══ LAPORAN PENJUALAN ═══
@@ -3500,32 +3624,22 @@ function seedV6() {
     log:[],
     master:{ toko:{nama:'King Parfum',telepon:'0812-3456-7890',alamat:'Jl. Merdeka No. 10, Jakarta',footer:'Terima kasih! 🌸'}, pajak:{aktif:true,nama:'PPN',persen:11}, diskon:{kasir:10,manager:50}, poin:{aktif:true,rate:1000,pin_threshold:1000,tiers:[{poin:1000,nilai:100000,min_belanja:300000},{poin:2000,nilai:200000,min_belanja:450000},{poin:4000,nilai:400000,min_belanja:700000}]}, komisi:{rate:1}, jam_operasional:{mulai:8,selesai:22}, absensi:{jam_masuk_max:'09:00',jam_keluar_min:'16:00',jam_lembur_mulai:'17:00'}, shift:{toleransi_menit:10}, sound:{aktif:true}, wa:{nomor_bisnis:''}, logo:null, pembayaran:[{id:'pm1',nama:'Tunai',icon:'💵',biaya:0,aktif:true},{id:'pm2',nama:'Debit',icon:'💳',biaya:0,aktif:true},{id:'pm3',nama:'QRIS',icon:'📱',biaya:0.7,aktif:true},{id:'pm4',nama:'Transfer',icon:'🏦',biaya:0,aktif:true},{id:'pm5',nama:'E-Wallet',icon:'📲',biaya:0,aktif:true}], struk:{mode:'wa',kertas:'58',autoPrint:false} }
   };
-  // 10 produk
   const prodSamples = [['Aqua Fresh 30ml','AQF-30',25000,10000,'refill','k2'],['Ocean Blue 50ml','OCB-50',45000,18000,'refill','k2'],['Sweet Floral 30ml','SWF-30',30000,12000,'refill','k2'],['Woody Sandal 30ml','WDS-30',32000,13000,'refill','k2'],['Vanilla Musk 50ml','VMS-50',48000,19000,'refill','k2'],['Botol Kaca 30ml','BTL-30',10000,3000,'bahan_baku','k3'],['Botol Kaca 50ml','BTL-50',12000,4000,'bahan_baku','k3'],['Pouch Premium','PCH-PRM',25000,12000,'aksesoris','k4'],['Essens Aqua 100ml','ECS-AQF',15000,5000,'bahan_cair','k6'],['Essens Ocean 100ml','ECS-OCB',16000,5500,'bahan_cair','k6']];
   prodSamples.forEach((arr,i) => d.produk.push({ id:'prd_v6_'+i, sku:arr[1], nama:arr[0], kategori_id:arr[5], klasifikasi:arr[4], harga_jual:arr[2], harga_beli:arr[3], stok:50+i*5, stok_min:10, satuan:'pcs', foto:null, aktif:true }));
-  // 10 bahan
   const bahanSamples = [['Essens Aqua','ml',500,50,500],['Essens Ocean','ml',450,50,550],['Alkohol 96%','ml',2000,200,50],['Kristal Pewarna','gram',100,20,1500],['Botol Kaca 30ml','pcs',150,20,3000],['Botol Kaca 50ml','pcs',120,20,4000],['Botol Plastik 10ml','pcs',200,30,1500],['Tutup Spray','pcs',300,50,800],['Stiker Label','pcs',500,100,200],['Pouch Premium','pcs',80,15,12000]];
   bahanSamples.forEach((arr,i) => d.bahan_baku.push({ id:'bb_'+i, nama:arr[0], satuan:arr[1], stok:arr[2], stok_min:arr[3], harga_beli:arr[4], klasifikasi:'bahan_cair' }));
-  // 10 pelanggan
   const pelSamples = [['Siti Aminah','081234567890','silver',450,1500000,['VIP'],'👩'],['Budi Santoso','081234567891','bronze',120,450000,[],'👨'],['Rina Marlina','081234567892','gold',1250,5500000,['VIP','Member'],'👩‍🦰'],['Dewi Lestari','081234567893','silver',800,2100000,[],'👩'],['Agus Salim','081234567894','bronze',60,180000,[],'👨'],['Maya Sari','081234567895','gold',2500,12000000,['VIP'],'👩'],['Andi Pratama','081234567896','silver',600,950000,[],'👨'],['Lina Wijaya','081234567897','bronze',30,80000,[],'👩'],['Rudi Hartono','081234567898','silver',900,1800000,['Member'],'👨'],['Fitri Handayani','081234567899','bronze',200,600000,[],'👩']];
   pelSamples.forEach((arr,i) => d.pelanggan.push({ id:'p_'+(i+1), nama:arr[0], telepon:arr[1], tier:arr[2], poin:arr[3], total_belanja:arr[4], tags:arr[5], avatar:arr[6] }));
-  // 10 karyawan
   const karSamples = [['Andi Wijaya','Kasir','081211100001',2500000,500000,'1111','kasir'],['Rina Marlina','Kasir','081211100002',2500000,500000,'2222','kasir'],['Dedi Kurniawan','Manager','081211100003',4000000,1000000,'3333','manager'],['Budi Santoso','Gudang','081211100004',2200000,300000,'4444','gudang'],['Eka Putri','Kasir','081211100005',2400000,400000,'5555','kasir'],['Fajar Nugroho','Packing','081211100006',2000000,250000,'6666','kasir'],['Gita Sari','Admin Online','081211100007',2300000,350000,'7777','kasir'],['Hadi Susanto','Kurir','081211100008',1900000,200000,'8888','gudang'],['Indah Permata','Supervisor','081211100009',3500000,700000,'9999','manager'],['Joko Widodo','Gudang','081211100010',2100000,300000,'0000','gudang']];
   karSamples.forEach((arr,i) => d.karyawan.push({ id:'kr_'+(i+1), nama:arr[0], jabatan:arr[1], telepon:arr[2], gaji_pokok:arr[3], tunjangan:arr[4], pin:arr[5], role:arr[6], username:'karyawan'+(i+1), aktif:true }));
-  // 10 supplier
   const supSamples = [['PT Aroma Nusantara','0813000001','sales@aromanusantara.com','Jakarta'],['CV Wangi Sejahtera','0813000002','order@wangisejahtera.com','Bandung'],['PT Essens Prima','0813000003','info@essensprima.com','Surabaya'],['Toko Botol Jaya','0813000004','-','Jakarta'],['PT Kemasan Indah','0813000005','sales@kemasanindah.com','Tangerang'],['CV Spray Mandiri','0813000006','-','Bekasi'],['PT Label Kreatif','0813000007','order@labelkreatif.com','Jakarta'],['UD Plastik Murah','0813000008','-','Bekasi'],['PT Pouch Prima','0813000009','sales@pouchprima.com','Bandung'],['CV Alkohol Jaya','0813000010','-','Surabaya']];
   supSamples.forEach((arr,i) => d.suppliers.push({ id:'sup_'+i, nama:arr[0], telepon:arr[1], email:arr[2], alamat:arr[3] }));
-  // 10 voucher
   const vSamples = [['PROMO10',10,100,5],['NEWMEMBER',15,50,2],['WEEKEND20',20,30,8],['FLASH25',25,20,12],['HEMAT5',5,200,20],['LOYAL15',15,50,3],['SPESIAL30',30,10,1],['BUNDLE12',12,40,7],['GRATISONGKIR',10,100,0],['RAMADHAN18',18,60,4]];
   vSamples.forEach((arr,i) => d.vouchers.push({ id:'v_'+(i+1), kode:arr[0], diskon:arr[1], kuota:arr[2], terpakai:arr[3], expired:null, aktif:true, created_at:nowISO() }));
-  // 10 PO
   for (let i = 0; i < 10; i++) { const prod = d.produk[i%d.produk.length]; const qty = 5+i; const harga = prod.harga_beli; d.purchase_orders.push({ id:'po_'+i, nomor:'PO-'+(1000+i), supplier:d.suppliers[i].nama, tgl:new Date(Date.now()-i*86400000).toISOString().slice(0,10), items:[{produk_id:prod.id,nama:prod.nama,qty,harga,subtotal:qty*harga}], total:qty*harga, status:i<3?'draft':'diterima', created_at:nowISO() }); }
-  // 10 shift schedule
   const todayD = new Date(); const dow = todayD.getDay(); const monday = new Date(todayD); monday.setDate(todayD.getDate()-((dow+6)%7));
   for (let i = 0; i < 10; i++) { const tgl = new Date(monday); tgl.setDate(monday.getDate()+(i%7)); const shift = ['Pagi','Siang','Malam'][i%3]; const jam = {Pagi:['08:00','14:00'],Siang:['14:00','20:00'],Malam:['20:00','02:00']}[shift]; d.shift_schedules.push({ id:'sch_'+i, karyawan_id:d.karyawan[i%d.karyawan.length].id, tanggal:tgl.toISOString().slice(0,10), shift, jam_mulai:jam[0], jam_selesai:jam[1] }); }
-  // 10 transaksi
   for (let i = 9; i >= 0; i--) { const dt = new Date(); dt.setDate(dt.getDate()-i); const tgl = dt.toISOString().slice(0,10); const prod = d.produk[i%d.produk.length]; const qty = 1+(i%3); const sub = prod.harga_jual*qty; const pajak = Math.round(sub*0.11); const total = sub+pajak; const pel = d.pelanggan[i%d.pelanggan.length]; const kas = d.karyawan[i%d.karyawan.length]; d.transaksi.push({ id:'trx_'+i, nomor:'INV-V6-'+String(1000+i), tanggal:tgl, kasir_id:kas.id, kasir_nama:kas.nama, pelanggan_id:pel.id, pelanggan_nama:pel.nama, items:[{produk_id:prod.id,nama:prod.nama,harga:prod.harga_jual,qty,subtotal:sub}], subtotal:sub, diskon:0, pajak, total, bayar:total, kembalian:0, metode:[{id:'pm1',nama:'Tunai',icon:'💵',jumlah:total}], status:'selesai', poin_didapat:Math.floor(sub/1000), created_at:dt.toISOString() }); }
-  // 10 notif
   const notifSamples = [['Stok Kritis','Botol Kaca 30ml sisa 5','warning'],['Transaksi','INV-V6-1009 selesai','success'],['Pelanggan Baru','Lina Wijaya terdaftar','info'],['Redeem','Siti Aminah redeem','success'],['Shift','Andi buka shift','info'],['Payroll','Periode lalu digenerate','info'],['Stok','Essens Aqua sisa 50','warning'],['Transaksi Besar','Total 1,2jt','success'],['Backup','Auto-save berhasil','info'],['Login','Rina login','info']];
   notifSamples.forEach((arr,i) => d.notifications.push({ id:'not_'+i, title:arr[0], msg:arr[1], type:arr[2], read:i>5, created_at:new Date(Date.now()-i*3600000).toISOString() }));
   return d;
@@ -3553,7 +3667,6 @@ function seedV6() {
         startAutoSync();
         applyLogoEverywhere(DB.data.master.logo);
         refreshIcons();
-        // isi tanggal
         setTimeout(()=>{
           const d = document.getElementById('dashDari'); if (d) { d.value = today(); const ds = document.getElementById('dashSampai'); if (ds) ds.value = today(); }
           const lp = document.getElementById('lapDari'); if (lp) { lp.value = new Date(Date.now()-30*86400000).toISOString().slice(0,10); const ls = document.getElementById('lapSampai'); if (ls) ls.value = today(); }
@@ -3564,7 +3677,6 @@ function seedV6() {
       }
     } catch(e) { console.warn('auto-login fail',e); }
   }
-  // show login
   document.getElementById('loginScreen').classList.remove('hidden');
   applyLogoEverywhere(DB.data.master.logo);
   document.getElementById('loginPassword').addEventListener('keypress', e => { if (e.key === 'Enter') doLogin(); });
